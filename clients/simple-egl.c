@@ -31,6 +31,7 @@
 #include <math.h>
 #include <assert.h>
 #include <signal.h>
+#include <pthread.h>
 
 #include <linux/input.h>
 
@@ -50,10 +51,42 @@
 #include "shared/platform.h"
 #include "shared/weston-egl-ext.h"
 
-struct window;
 struct seat;
+struct geometry {
+	int width, height;
+};
+struct display;
+struct window {
+	pthread_t tid;
+
+	struct display *display;
+	struct geometry geometry, window_size;
+	struct {
+		GLuint rotation_uniform;
+		GLuint pos;
+		GLuint col;
+	} gl;
+
+	uint32_t benchmark_time, frames;
+	struct wl_egl_window *native;
+	struct wl_surface *surface;
+	struct xdg_surface *xdg_surface;
+	struct xdg_toplevel *xdg_toplevel;
+
+	EGLContext egl_ctx;
+	EGLSurface egl_surface;
+	struct wl_callback *callback;
+	int fullscreen, maximized, opaque, buffer_size, frame_sync, delay;
+
+	bool need_render, wait_for_configure;
+};
 
 struct display {
+	int status;
+	pthread_t tid;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+
 	struct wl_display *display;
 	struct wl_registry *registry;
 	struct wl_compositor *compositor;
@@ -71,33 +104,12 @@ struct display {
 		EGLContext ctx;
 		EGLConfig conf;
 	} egl;
-	struct window *window;
+
+	int win_num;
+	struct window window;
+	struct window * windows;
 
 	PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC swap_buffers_with_damage;
-};
-
-struct geometry {
-	int width, height;
-};
-
-struct window {
-	struct display *display;
-	struct geometry geometry, window_size;
-	struct {
-		GLuint rotation_uniform;
-		GLuint pos;
-		GLuint col;
-	} gl;
-
-	uint32_t benchmark_time, frames;
-	struct wl_egl_window *native;
-	struct wl_surface *surface;
-	struct xdg_surface *xdg_surface;
-	struct xdg_toplevel *xdg_toplevel;
-	EGLSurface egl_surface;
-	struct wl_callback *callback;
-	int fullscreen, maximized, opaque, buffer_size, frame_sync, delay;
-	bool wait_for_configure;
 };
 
 static const char *vert_shader_text =
@@ -193,10 +205,10 @@ init_egl(struct display *display, struct window *window)
 		exit(EXIT_FAILURE);
 	}
 
-	display->egl.ctx = eglCreateContext(display->egl.dpy,
+	window->egl_ctx = eglCreateContext(display->egl.dpy,
 					    display->egl.conf,
 					    EGL_NO_CONTEXT, context_attribs);
-	assert(display->egl.ctx);
+	assert(window->egl_ctx);
 
 	display->swap_buffers_with_damage = NULL;
 	extensions = eglQueryString(display->egl.dpy, EGL_EXTENSIONS);
@@ -294,10 +306,15 @@ handle_surface_configure(void *data, struct xdg_surface *surface,
 			 uint32_t serial)
 {
 	struct window *window = data;
+	struct display * dpy = window->display;
 
 	xdg_surface_ack_configure(surface, serial);
 
+	pthread_mutex_lock(&dpy->mutex);
 	window->wait_for_configure = false;
+	window->need_render = true;
+	pthread_cond_broadcast(&dpy->cond);
+	pthread_mutex_unlock(&dpy->mutex);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -387,7 +404,7 @@ create_surface(struct window *window)
 	wl_surface_commit(window->surface);
 
 	ret = eglMakeCurrent(window->display->egl.dpy, window->egl_surface,
-			     window->egl_surface, window->display->egl.ctx);
+			     window->egl_surface, window->egl_ctx);
 	assert(ret == EGL_TRUE);
 
 	if (!window->frame_sync)
@@ -534,7 +551,7 @@ pointer_handle_enter(void *data, struct wl_pointer *pointer,
 	struct wl_cursor *cursor = display->default_cursor;
 	struct wl_cursor_image *image;
 
-	if (display->window->fullscreen)
+	if (display->window.fullscreen)
 		wl_pointer_set_cursor(pointer, serial, NULL, 0, 0);
 	else if (cursor) {
 		image = display->default_cursor->images[0];
@@ -571,11 +588,11 @@ pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
 {
 	struct display *display = data;
 
-	if (!display->window->xdg_toplevel)
+	if (!display->window.xdg_toplevel)
 		return;
 
 	if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED)
-		xdg_toplevel_move(display->window->xdg_toplevel,
+		xdg_toplevel_move(display->window.xdg_toplevel,
 				  display->seat, serial);
 }
 
@@ -603,7 +620,7 @@ touch_handle_down(void *data, struct wl_touch *wl_touch,
 	if (!d->wm_base)
 		return;
 
-	xdg_toplevel_move(d->window->xdg_toplevel, d->seat, serial);
+	xdg_toplevel_move(d->window.xdg_toplevel, d->seat, serial);
 }
 
 static void
@@ -668,10 +685,10 @@ keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 		return;
 
 	if (key == KEY_F11 && state) {
-		if (d->window->fullscreen)
-			xdg_toplevel_unset_fullscreen(d->window->xdg_toplevel);
+		if (d->window.fullscreen)
+			xdg_toplevel_unset_fullscreen(d->window.xdg_toplevel);
 		else
-			xdg_toplevel_set_fullscreen(d->window->xdg_toplevel, NULL);
+			xdg_toplevel_set_fullscreen(d->window.xdg_toplevel, NULL);
 	} else if (key == KEY_ESC && state)
 		running = 0;
 }
@@ -805,92 +822,191 @@ usage(int error_code)
 	exit(error_code);
 }
 
+
+static void *
+win_render_thread(void * param)
+{
+	EGLBoolean ret;
+	struct window * win = param;
+	struct display * dpy = win->display;
+
+	pthread_mutex_lock(&dpy->mutex);
+	while (dpy->status != -1 && win->wait_for_configure) {
+		pthread_cond_wait(&dpy->cond, &dpy->mutex);
+	}
+	pthread_mutex_unlock(&dpy->mutex);
+
+	ret = eglMakeCurrent(dpy->egl.dpy, win->egl_surface,
+						 win->egl_surface, win->egl_ctx);
+	assert(ret == EGL_TRUE);
+
+	pthread_mutex_lock(&dpy->mutex);
+	while (dpy->status != -1 && !win->need_render) {
+		pthread_cond_wait(&dpy->cond, &dpy->mutex);
+		if (dpy->status != -1 && win->need_render) {
+			pthread_mutex_unlock(&dpy->mutex);
+
+			redraw(win, NULL, 0);
+
+			pthread_mutex_lock(&dpy->mutex);
+			continue;
+		}
+	}
+	pthread_mutex_unlock(&dpy->mutex);
+
+	ret = eglMakeCurrent(dpy->egl.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+	assert(ret == EGL_TRUE);
+
+	return NULL;
+}
+
+static void *
+weston_thread(void * param)
+{
+	int i;
+	struct display * dpy = param;
+	dpy->display = wl_display_connect(NULL);
+	assert(dpy->display);
+
+	dpy->registry = wl_display_get_registry(dpy->display);
+	wl_registry_add_listener(dpy->registry,
+				 &registry_listener, dpy);
+
+	wl_display_roundtrip(dpy->display);
+
+	dpy->cursor_surface =
+		wl_compositor_create_surface(dpy->compositor);
+
+	dpy->windows = calloc(sizeof(dpy->window), dpy->win_num);
+	if (!dpy->windows) {
+		assert(0 && "no enough memory!");
+		return NULL;
+	}
+
+	for (i=0; i<dpy->win_num; i++) {
+		dpy->windows[i] = dpy->window;
+
+		init_egl(dpy, &dpy->windows[i]);
+		create_surface(&dpy->windows[i]);
+		init_gl(&dpy->windows[i]);
+
+		pthread_create(&dpy->windows[i].tid, NULL, win_render_thread,
+					   (void *)&dpy->windows[i]);
+	}
+
+	/* The mainloop here is a little subtle.  Redrawing will cause
+	 * EGL to read events so we can just call
+	 * wl_display_dispatch_pending() to handle any events that got
+	 * queued up as a side effect. */
+
+	pthread_mutex_lock(&dpy->mutex);
+	while(dpy->status != -1) {
+		wl_display_dispatch(dpy->display);
+	}
+	pthread_mutex_unlock(&dpy->mutex);
+
+	/* 		wl_display_dispatch(display.display); */
+	/* 	} else { */
+	/* 		wl_display_dispatch_pending(display.display); */
+	/* 		redraw(&window, NULL, 0); */
+	/* 	} */
+	/* } */
+
+	fprintf(stderr, "simple-egl exiting\n");
+
+	for (i=0; i<dpy->win_num; i++) {
+		pthread_join(dpy->windows[i].tid, NULL);
+	}
+//	destroy_surface(&window);
+	fini_egl(dpy);
+
+	free(dpy->windows);
+
+	wl_surface_destroy(dpy->cursor_surface);
+	if (dpy->cursor_theme)
+		wl_cursor_theme_destroy(dpy->cursor_theme);
+
+	if (dpy->wm_base)
+		xdg_wm_base_destroy(dpy->wm_base);
+
+	if (dpy->compositor)
+		wl_compositor_destroy(dpy->compositor);
+
+	wl_registry_destroy(dpy->registry);
+	wl_display_flush(dpy->display);
+	wl_display_disconnect(dpy->display);
+
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
-	struct sigaction sigint;
-	struct display display = { 0 };
-	struct window  window  = { 0 };
-	int i, ret = 0;
+	struct display dpy = {
+		.status = 0,
+		.mutex = PTHREAD_MUTEX_INITIALIZER,
+		.cond  = PTHREAD_COND_INITIALIZER,
+		.win_num = 1,
+		.windows = NULL,
+	};
+	int i;
 
-	window.display = &display;
-	display.window = &window;
-	window.geometry.width  = 250;
-	window.geometry.height = 250;
-	window.window_size = window.geometry;
-	window.buffer_size = 32;
-	window.frame_sync = 1;
-	window.delay = 0;
+	dpy.win_num = 1;
+	dpy.window.display = &dpy;
+	dpy.window.geometry.width  = 250;
+	dpy.window.geometry.height = 250;
+	dpy.window.window_size = dpy.window.geometry;
+	dpy.window.buffer_size = 32;
+	dpy.window.frame_sync = 1;
+	dpy.window.delay = 0;
+	dpy.window.need_render = false;
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp("-d", argv[i]) == 0 && i+1 < argc)
-			window.delay = atoi(argv[++i]);
+			dpy.window.delay = atoi(argv[++i]);
 		else if (strcmp("-f", argv[i]) == 0)
-			window.fullscreen = 1;
+			dpy.window.fullscreen = 1;
 		else if (strcmp("-o", argv[i]) == 0)
-			window.opaque = 1;
+			dpy.window.opaque = 1;
 		else if (strcmp("-s", argv[i]) == 0)
-			window.buffer_size = 16;
+			dpy.window.buffer_size = 16;
 		else if (strcmp("-b", argv[i]) == 0)
-			window.frame_sync = 0;
+			dpy.window.frame_sync = 0;
 		else if (strcmp("-h", argv[i]) == 0)
 			usage(EXIT_SUCCESS);
 		else
 			usage(EXIT_FAILURE);
 	}
 
-	display.display = wl_display_connect(NULL);
-	assert(display.display);
+	pthread_create(&dpy.tid, NULL, weston_thread, (void *)&dpy);
 
-	display.registry = wl_display_get_registry(display.display);
-	wl_registry_add_listener(display.registry,
-				 &registry_listener, &display);
+	sigset_t sigset;
+	siginfo_t seginfo;
+	sigfillset(&sigset);
+	//sigemptyset(&sigset);
+	//sigaddset(&sigset, SIGTERM);
+	while (1) {
+		printf("sigwaitinfo:\n");
 
-	wl_display_roundtrip(display.display);
+		if (sigwaitinfo(&sigset, &seginfo) == -1)
+			continue;
 
-	init_egl(&display, &window);
-	create_surface(&window);
-	init_gl(&window);
+		printf("siginfo: si_signo = %x \n", seginfo.si_signo);
 
-	display.cursor_surface =
-		wl_compositor_create_surface(display.compositor);
-
-	sigint.sa_handler = signal_int;
-	sigemptyset(&sigint.sa_mask);
-	sigint.sa_flags = SA_RESETHAND;
-	sigaction(SIGINT, &sigint, NULL);
-
-	/* The mainloop here is a little subtle.  Redrawing will cause
-	 * EGL to read events so we can just call
-	 * wl_display_dispatch_pending() to handle any events that got
-	 * queued up as a side effect. */
-	while (running && ret != -1) {
-		if (window.wait_for_configure) {
-			ret = wl_display_dispatch(display.display);
-		} else {
-			ret = wl_display_dispatch_pending(display.display);
-			redraw(&window, NULL, 0);
+		if (seginfo.si_signo == SIGTERM ||
+			seginfo.si_signo == SIGINT) {
+			break;
 		}
 	}
 
-	fprintf(stderr, "simple-egl exiting\n");
+	// emit exit signal
+	pthread_mutex_lock(&dpy.mutex);
+	dpy.status = -1;
+	pthread_cond_broadcast(&dpy.cond);
+	pthread_mutex_unlock(&dpy.mutex);
 
-	destroy_surface(&window);
-	fini_egl(&display);
-
-	wl_surface_destroy(display.cursor_surface);
-	if (display.cursor_theme)
-		wl_cursor_theme_destroy(display.cursor_theme);
-
-	if (display.wm_base)
-		xdg_wm_base_destroy(display.wm_base);
-
-	if (display.compositor)
-		wl_compositor_destroy(display.compositor);
-
-	wl_registry_destroy(display.registry);
-	wl_display_flush(display.display);
-	wl_display_disconnect(display.display);
+	pthread_join(dpy.tid, NULL);
 
 	return 0;
 }
+
