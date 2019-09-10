@@ -890,6 +890,10 @@ weston_thread(void * param)
 		create_surface(&dpy->windows[i]);
 		init_gl(&dpy->windows[i]);
 
+		eglMakeCurrent(dpy->egl.dpy,
+					   EGL_NO_SURFACE, EGL_NO_SURFACE,
+					   EGL_NO_CONTEXT);
+
 		pthread_create(&dpy->windows[i].tid, NULL, win_render_thread,
 					   (void *)&dpy->windows[i]);
 	}
@@ -898,12 +902,15 @@ weston_thread(void * param)
 	 * EGL to read events so we can just call
 	 * wl_display_dispatch_pending() to handle any events that got
 	 * queued up as a side effect. */
-
-	pthread_mutex_lock(&dpy->mutex);
-	while(dpy->status != -1) {
+	int stop = 0;
+	while(1) {
+		pthread_mutex_lock(&dpy->mutex);
+		stop = dpy->status == -1 ? 1 : 0;
+		pthread_mutex_unlock(&dpy->mutex);
+		if (stop)
+			break;
 		wl_display_dispatch(dpy->display);
 	}
-	pthread_mutex_unlock(&dpy->mutex);
 
 	/* 		wl_display_dispatch(display.display); */
 	/* 	} else { */
