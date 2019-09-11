@@ -68,6 +68,8 @@ struct window {
 	} gl;
 
 	uint32_t benchmark_time, frames;
+
+	struct wl_event_queue queue;
 	struct wl_egl_window *native;
 	struct wl_surface *surface;
 	struct xdg_surface *xdg_surface;
@@ -354,10 +356,11 @@ handle_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
 		window->geometry = window->window_size;
 	}
 
-	if (window->native)
+	if (window->native) {
 		wl_egl_window_resize(window->native,
 				     window->geometry.width,
 				     window->geometry.height, 0, 0);
+	}
 }
 
 static void
@@ -395,6 +398,7 @@ create_surface(struct window *window)
 
 	window->xdg_toplevel =
 		xdg_surface_get_toplevel(window->xdg_surface);
+
 	xdg_toplevel_add_listener(window->xdg_toplevel,
 				  &xdg_toplevel_listener, window);
 
@@ -830,26 +834,35 @@ win_render_thread(void * param)
 	struct window * win = param;
 	struct display * dpy = win->display;
 
+	wl_event_queue_init(&win->queue, dpy->display);
+
+	init_egl(dpy, &dpy->windows[i]);
+	create_surface(&dpy->windows[i]);
+	init_gl(&dpy->windows[i]);
+
 	pthread_mutex_lock(&dpy->mutex);
 	while (dpy->status != -1 && win->wait_for_configure) {
 		pthread_cond_wait(&dpy->cond, &dpy->mutex);
 	}
 	pthread_mutex_unlock(&dpy->mutex);
 
-	ret = eglMakeCurrent(dpy->egl.dpy, win->egl_surface,
-						 win->egl_surface, win->egl_ctx);
-	assert(ret == EGL_TRUE);
+	/* ret = eglMakeCurrent(dpy->egl.dpy, win->egl_surface, */
+	/* 					 win->egl_surface, win->egl_ctx); */
+	/* assert(ret == EGL_TRUE); */
 
 	pthread_mutex_lock(&dpy->mutex);
-	while (dpy->status != -1 && !win->need_render) {
-		pthread_cond_wait(&dpy->cond, &dpy->mutex);
+	while (dpy->status != -1) {
+		while(dpy->status != -1 && !win->need_render) {
+			pthread_cond_wait(&dpy->cond, &dpy->mutex);
+		}
 		if (dpy->status != -1 && win->need_render) {
 			pthread_mutex_unlock(&dpy->mutex);
+
+			wl_display_dispatch_queue_pending(dpy->display, &win->queue);
 
 			redraw(win, NULL, 0);
 
 			pthread_mutex_lock(&dpy->mutex);
-			continue;
 		}
 	}
 	pthread_mutex_unlock(&dpy->mutex);
@@ -886,13 +899,6 @@ weston_thread(void * param)
 	for (i=0; i<dpy->win_num; i++) {
 		dpy->windows[i] = dpy->window;
 
-		init_egl(dpy, &dpy->windows[i]);
-		create_surface(&dpy->windows[i]);
-		init_gl(&dpy->windows[i]);
-
-		eglMakeCurrent(dpy->egl.dpy,
-					   EGL_NO_SURFACE, EGL_NO_SURFACE,
-					   EGL_NO_CONTEXT);
 
 		pthread_create(&dpy->windows[i].tid, NULL, win_render_thread,
 					   (void *)&dpy->windows[i]);
@@ -985,19 +991,25 @@ main(int argc, char **argv)
 			usage(EXIT_FAILURE);
 	}
 
-	pthread_create(&dpy.tid, NULL, weston_thread, (void *)&dpy);
 
 	sigset_t sigset;
 	siginfo_t seginfo;
 	sigfillset(&sigset);
 	//sigemptyset(&sigset);
 	//sigaddset(&sigset, SIGTERM);
+	//sigaddset(&sigset, SIGTERM);
+	//sigemptyset(&sigset);
+	//sigaddset(&sigset, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+
+	pthread_create(&dpy.tid, NULL, weston_thread, (void *)&dpy);
 	while (1) {
 		printf("sigwaitinfo:\n");
 
-		if (sigwaitinfo(&sigset, &seginfo) == -1)
+		if (sigwaitinfo(&sigset, &seginfo) == -1) {
+			printf("siginfo: si_signo = %x \n", seginfo.si_signo);
 			continue;
-
+		}
 		printf("siginfo: si_signo = %x \n", seginfo.si_signo);
 
 		if (seginfo.si_signo == SIGTERM ||
@@ -1006,14 +1018,16 @@ main(int argc, char **argv)
 		}
 	}
 
+	printf("cleanup...\n");
 	// emit exit signal
 	pthread_mutex_lock(&dpy.mutex);
 	dpy.status = -1;
 	pthread_cond_broadcast(&dpy.cond);
 	pthread_mutex_unlock(&dpy.mutex);
 
+	printf("waiting for threads ...");
 	pthread_join(dpy.tid, NULL);
+	printf("done!\n");
 
 	return 0;
 }
-

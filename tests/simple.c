@@ -62,7 +62,7 @@ static void
 create_window() {
 
     egl_window = wl_egl_window_create(surface,
-									  480, 360);
+									  320, 200);
     if (egl_window == EGL_NO_SURFACE) {
 		fprintf(stderr, "Can't create egl window\n");
 		exit(1);
@@ -82,11 +82,9 @@ create_window() {
 		fprintf(stderr, "Made current failed\n");
     }
 
-    /*
-	  glClearColor(1.0, 1.0, 0.0, 1.0);
-	  glClear(GL_COLOR_BUFFER_BIT);
-	  glFlush();
-    */
+	glClearColor(1.0, 1.0, 0.0, 1.0);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glFlush();
 
     if (eglSwapBuffers(egl_display, egl_surface)) {
 		fprintf(stderr, "Swapped buffers\n");
@@ -114,7 +112,6 @@ init_egl() {
 		EGL_NONE
     };
 
-    
     egl_display = eglGetDisplay((EGLNativeDisplayType) display);
     if (egl_display == EGL_NO_DISPLAY) {
 		fprintf(stderr, "Can't create egl display\n");
@@ -133,10 +130,8 @@ init_egl() {
     printf("EGL has %d configs\n", count);
 
     configs = calloc(count, sizeof *configs);
-    
     eglChooseConfig(egl_display, config_attribs,
 					configs, count, &n);
-    
     for (i = 0; i < n; i++) {
 		eglGetConfigAttrib(egl_display,
 						   configs[i], EGL_BUFFER_SIZE, &size);
@@ -144,7 +139,6 @@ init_egl() {
 		eglGetConfigAttrib(egl_display,
 						   configs[i], EGL_RED_SIZE, &size);
 		printf("Red size for config %d is %d\n", i, size);
-	
 		// just choose the first one
 		egl_conf = configs[i];
 		break;
