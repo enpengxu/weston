@@ -87,7 +87,7 @@ registry_handle_global(void *data,
 					   const char *interface,
 					   uint32_t version)
 {
-    dlog("Got a registry event for %s id %d\n", interface, id);
+    dlog("Got a registry event for %s id %u\n", interface, id);
     if (strcmp(interface, "wl_compositor") == 0) {
         wl_compositor = wl_registry_bind(registry,
 									  id,
@@ -105,7 +105,7 @@ registry_handle_global_remover(void *data,
 							   struct wl_registry *registry,
 							   uint32_t id)
 {
-    dlog("Got a registry losing event for %d\n", id);
+    dlog("Got a registry losing event for %u\n", id);
 }
 
 static int
@@ -481,10 +481,11 @@ int main(int argc, char **argv)
 	// init wayland winsys
 	sys_init();
 
-	// block all signals
+	// Block all signals except SIGTSTP.
 	sigset_t sigset;
 	siginfo_t seginfo;
 	sigfillset(&sigset);
+	sigdelset(&sigset, SIGTSTP);
 	pthread_sigmask(SIG_BLOCK, &sigset, NULL);
 
 	// create threads
@@ -496,10 +497,10 @@ int main(int argc, char **argv)
 	while (1) {
 		dlog("sigwaitinfo:\n");
 		if (sigwaitinfo(&sigset, &seginfo) == -1) {
-			dlog("siginfo: si_signo = %x \n", seginfo.si_signo);
+			dlog("siginfo: si_signo = %d \n", seginfo.si_signo);
 			continue;
 		}
-		dlog("siginfo: si_signo = %x \n", seginfo.si_signo);
+		dlog("siginfo: si_signo = %d \n", seginfo.si_signo);
 
 		// exit if get SIGTERM or SIGINT
 		if (seginfo.si_signo == SIGTERM ||
