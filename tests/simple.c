@@ -25,11 +25,15 @@ static char * tabs[] = {
 };
 
 // debug log output
-#define dlog(...)														\
+#if 1
+ #define dlog(...)														\
 	if(verbose >= log_verbose) {										\
-		printf("%s:%d : %s", __FUNCTION__, __LINE__, tabs[log_verbose]); \
+		printf("%s%s[%d] ", tabs[log_verbose-1], __FUNCTION__, __LINE__); \
 		printf(__VA_ARGS__);											\
 	}
+#else
+ #define dlog(...)
+#endif
 
 #define FAILED_IF(rc)							\
 	if (rc) {									\
@@ -123,6 +127,7 @@ sys_egl_dpy_init()
 		EGL_CONTEXT_CLIENT_VERSION, 2,
 		EGL_NONE
     };
+
 	log_verbose ++;
 
     egl_display = eglGetDisplay((EGLNativeDisplayType) wl_display);
@@ -386,6 +391,8 @@ static int
 win_init(struct window * win)
 {
 	int rc;
+	log_verbose ++;
+
 	dlog("win_init \n");
 
 	rc = win_wl_init(win);
@@ -399,20 +406,23 @@ win_init(struct window * win)
 	rc = win_egl_surf_init(win);
 	FAILED_IF(rc);
 
+	log_verbose --;
 	return rc;
 }
 
 static void
 win_fini(struct window * win)
 {
-	// correct order should be :
-	// wl_fini
-	// egl_surf_fini
-	// egl_ctx_fini
-	// but we will get troubles in wayland egl driver(damage_thread),
-	// it try to access a surface proxy but it has been destroied.
-	// make a work around here.
+	// we can release resources in two orders:
+	// 1.  wl_fini, egl_fini, or
+	// 2. egl_fini,  wl_fini
+	// In theroy, both order 1 or 2 should work. but in practice,
+	// order 1 will cause app crashed in wayland egl driver(damage_thread),
+	// in damage_thread, it try to access a surface proxy which has been destroied.
+	// it is a known issue, so make a work around here.
+	// always release egl resource first to avoid crash.
 
+	log_verbose ++;
 	dlog("win_egl_surf_fini ...\n");
     win_egl_surf_fini(win);
 
@@ -421,6 +431,7 @@ win_fini(struct window * win)
 
 	dlog("win_wl_fini ...\n");
 	win_wl_fini(win);
+	log_verbose --;
 }
 
 static void *
